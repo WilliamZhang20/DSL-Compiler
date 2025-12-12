@@ -19,4 +19,4 @@ fn main() -> i32 {
     return add(123, 456) + add(10, 20)
 }
 ```
-Expect: `=> 609` as output
+- After pressing enter to leave a line blank, expect `=> 609` as output.
