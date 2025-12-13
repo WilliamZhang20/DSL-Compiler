@@ -2,6 +2,7 @@
 #include <llvm/IR/Module.h>
 #include <llvm/IR/IRBuilder.h>
 #include <llvm/IR/Verifier.h>
+#include <llvm/IR/Intrinsics.h>
 #include <llvm/Support/TargetSelect.h>
 #include <llvm/ExecutionEngine/Orc/LLJIT.h>
 #include <llvm/ExecutionEngine/Orc/ThreadSafeModule.h>
@@ -16,12 +17,13 @@ using namespace llvm;
 using namespace llvm::orc;
 
 // ──────────────────────────────────────────────────────────────
-// Tokenizer (extended for f32, vec4, vec8, dot notation)
+// Tokenizer (extended for control flow)
 // ──────────────────────────────────────────────────────────────
 enum Token {
     TokEof, TokFn, TokReturn, TokVar, TokIdent, TokNumber, TokFloat,
     TokLParen, TokRParen, TokLBrace, TokRBrace, TokColon, TokArrow,
-    TokComma, TokDot, TokPlus, TokMul, TokSemi
+    TokComma, TokDot, TokPlus, TokMul, TokSemi, TokIf, TokElse,
+    TokFor, TokIn, TokRange, TokLess, TokGreater, TokEqual, TokAssign
 };
 
 struct Tokenizer {
@@ -44,14 +46,18 @@ struct Tokenizer {
             if (IdentStr == "fn") return CurTok = TokFn;
             if (IdentStr == "return") return CurTok = TokReturn;
             if (IdentStr == "var") return CurTok = TokVar;
+            if (IdentStr == "if") return CurTok = TokIf;
+            if (IdentStr == "else") return CurTok = TokElse;
+            if (IdentStr == "for") return CurTok = TokFor;
+            if (IdentStr == "in") return CurTok = TokIn;
+            if (IdentStr == "range") return CurTok = TokRange;
             return CurTok = TokIdent;
         }
 
-        // number: start with digit OR '.' followed by a digit (so '.' as field access is preserved)
+        // number
         if (std::isdigit(*Ptr) || (*Ptr == '.' && std::isdigit(*(Ptr + 1)))) {
             char* End;
             FloatVal = strtod(Ptr, &End);
-            // support optional trailing 'f'/'F'
             if (End > Ptr && (*End == 'f' || *End == 'F')) ++End;
             Ptr = End;
             IntVal = (int)FloatVal;
@@ -71,9 +77,14 @@ struct Tokenizer {
             case '+': return CurTok = TokPlus;
             case '*': return CurTok = TokMul;
             case ';': return CurTok = TokSemi;
+            case '<': return CurTok = TokLess;
+            case '>': return CurTok = TokGreater;
             case '-':
                 if (*Ptr == '>') { ++Ptr; return CurTok = TokArrow; }
                 break;
+            case '=':
+                if (*Ptr == '=') { ++Ptr; return CurTok = TokEqual; }
+                return CurTok = TokAssign;
         }
         std::cerr << "Unknown char: " << c << "\n";
         return CurTok = TokEof;
@@ -81,16 +92,18 @@ struct Tokenizer {
 };
 
 // ──────────────────────────────────────────────────────────────
-// Compiler with vec4/vec8 support
-// ──────────────────────────────────────────────
+// Compiler with vec4/vec8 support + swizzling + control flow
+// ──────────────────────────────────────────────────────────────
 class Compiler {
     LLVMContext Context;
     std::unique_ptr<Module> Mod;
     IRBuilder<> Builder;
     std::unique_ptr<LLJIT> JIT;
     std::map<std::string, Value*> NamedValues;
+    std::map<std::string, AllocaInst*> NamedAllocas; // For mutable variables (when needed)
 
     Type* FloatTy;
+    Type* Int32Ty;
     FixedVectorType* Vec4Ty;
     FixedVectorType* Vec8Ty;
 
@@ -100,6 +113,7 @@ public:
         InitializeNativeTargetAsmPrinter();
 
         FloatTy = Type::getFloatTy(Context);
+        Int32Ty = Type::getInt32Ty(Context);
         Vec4Ty = FixedVectorType::get(FloatTy, 4);
         Vec8Ty = FixedVectorType::get(FloatTy, 8);
 
@@ -110,17 +124,24 @@ public:
     Type* parseType(Tokenizer& Tok) {
         if (Tok.CurTok != TokIdent) return nullptr;
         if (Tok.IdentStr == "f32") { Tok.getNextToken(); return FloatTy; }
-        if (Tok.IdentStr == "vec4") { Tok.getNextToken(); if (Tok.CurTok == TokIdent && Tok.IdentStr == "f32") Tok.getNextToken(); return Vec4Ty; }
-        if (Tok.IdentStr == "vec8") { Tok.getNextToken(); if (Tok.CurTok == TokIdent && Tok.IdentStr == "f32") Tok.getNextToken(); return Vec8Ty; }
+        if (Tok.IdentStr == "i32") { Tok.getNextToken(); return Int32Ty; }
+        if (Tok.IdentStr == "vec4") { 
+            Tok.getNextToken(); 
+            if (Tok.CurTok == TokIdent && Tok.IdentStr == "f32") Tok.getNextToken(); 
+            return Vec4Ty; 
+        }
+        if (Tok.IdentStr == "vec8") { 
+            Tok.getNextToken(); 
+            if (Tok.CurTok == TokIdent && Tok.IdentStr == "f32") Tok.getNextToken(); 
+            return Vec8Ty; 
+        }
         return nullptr;
     }
 
     Value* parseVectorLiteral(Tokenizer& Tok, FixedVectorType* VTy) {
-        // caller expects Tok.CurTok == TokLBrace
         std::vector<Constant*> Elems;
         unsigned N = VTy->getNumElements();
 
-        // consume '{'
         if (Tok.CurTok != TokLBrace) { std::cerr << "expected '{' for vector literal\n"; return nullptr; }
         Tok.getNextToken();
 
@@ -138,7 +159,161 @@ public:
         return ConstantVector::get(Elems);
     }
 
+    // Helper: reduce vector using LLVM intrinsic
+    Value* reduceVector(Value* V) {
+        auto *VecTy = cast<VectorType>(V->getType());
+        Function *Reduce = Intrinsic::getDeclaration(
+            Mod.get(),
+            Intrinsic::vector_reduce_fadd,
+            VecTy
+        );
+        Value *Zero = ConstantFP::get(FloatTy, 0.0);
+        return Builder.CreateCall(Reduce, {Zero, V}, "dot");
+    }
+
+    Value* parseIfExpr(Tokenizer& Tok) {
+        // if <expr> { <expr> } else { <expr> }
+        Tok.getNextToken(); // consume 'if'
+        
+        Value* CondV = parseExpr(Tok);
+        if (!CondV) return nullptr;
+
+        // Convert condition to bool by comparing with 0.0
+        Value* Zero = ConstantFP::get(FloatTy, 0.0);
+        Value* Cond = Builder.CreateFCmpONE(CondV, Zero, "ifcond");
+
+        Function* F = Builder.GetInsertBlock()->getParent();
+        BasicBlock* ThenBB = BasicBlock::Create(Context, "then", F);
+        BasicBlock* ElseBB = BasicBlock::Create(Context, "else", F);
+        BasicBlock* MergeBB = BasicBlock::Create(Context, "merge", F);
+
+        Builder.CreateCondBr(Cond, ThenBB, ElseBB);
+
+        // THEN branch
+        Builder.SetInsertPoint(ThenBB);
+        if (Tok.CurTok != TokLBrace) { std::cerr << "expected '{' after if condition\n"; return nullptr; }
+        Tok.getNextToken();
+        Value* ThenV = parseExpr(Tok);
+        if (!ThenV) return nullptr;
+        if (Tok.CurTok != TokRBrace) { std::cerr << "expected '}' after then block\n"; return nullptr; }
+        Tok.getNextToken();
+        Builder.CreateBr(MergeBB);
+        ThenBB = Builder.GetInsertBlock(); // Update in case of nested blocks
+
+        // ELSE branch
+        Builder.SetInsertPoint(ElseBB);
+        if (Tok.CurTok != TokElse) { std::cerr << "expected 'else'\n"; return nullptr; }
+        Tok.getNextToken();
+        if (Tok.CurTok != TokLBrace) { std::cerr << "expected '{' after else\n"; return nullptr; }
+        Tok.getNextToken();
+        Value* ElseV = parseExpr(Tok);
+        if (!ElseV) return nullptr;
+        if (Tok.CurTok != TokRBrace) { std::cerr << "expected '}' after else block\n"; return nullptr; }
+        Tok.getNextToken();
+        Builder.CreateBr(MergeBB);
+        ElseBB = Builder.GetInsertBlock();
+
+        // MERGE
+        Builder.SetInsertPoint(MergeBB);
+        PHINode* Phi = Builder.CreatePHI(ThenV->getType(), 2, "ifphi");
+        Phi->addIncoming(ThenV, ThenBB);
+        Phi->addIncoming(ElseV, ElseBB);
+
+        return Phi;
+    }
+
+    Value* parseForLoop(Tokenizer& Tok) {
+        // for <var> in range(<start>, <end>) { <body> }
+        Tok.getNextToken(); // consume 'for'
+
+        if (Tok.CurTok != TokIdent) { std::cerr << "expected loop variable\n"; return nullptr; }
+        std::string VarName = Tok.IdentStr;
+        Tok.getNextToken();
+
+        if (Tok.CurTok != TokIn) { std::cerr << "expected 'in'\n"; return nullptr; }
+        Tok.getNextToken();
+
+        if (Tok.CurTok != TokIdent || Tok.IdentStr != "range") { 
+            std::cerr << "expected 'range'\n"; return nullptr; 
+        }
+        Tok.getNextToken();
+
+        if (Tok.CurTok != TokLParen) { std::cerr << "expected '('\n"; return nullptr; }
+        Tok.getNextToken();
+
+        Value* StartV = parseExpr(Tok);
+        if (!StartV) return nullptr;
+
+        if (Tok.CurTok != TokComma) { std::cerr << "expected ','\n"; return nullptr; }
+        Tok.getNextToken();
+
+        Value* EndV = parseExpr(Tok);
+        if (!EndV) return nullptr;
+
+        if (Tok.CurTok != TokRParen) { std::cerr << "expected ')'\n"; return nullptr; }
+        Tok.getNextToken();
+
+        if (Tok.CurTok != TokLBrace) { std::cerr << "expected '{'\n"; return nullptr; }
+        Tok.getNextToken();
+
+        // Create loop structure
+        Function* F = Builder.GetInsertBlock()->getParent();
+        BasicBlock* PreheaderBB = Builder.GetInsertBlock();
+        BasicBlock* LoopBB = BasicBlock::Create(Context, "loop", F);
+        BasicBlock* AfterBB = BasicBlock::Create(Context, "afterloop", F);
+
+        // Convert start/end to int32
+        Value* Start = Builder.CreateFPToSI(StartV, Int32Ty, "start_int");
+        Value* End = Builder.CreateFPToSI(EndV, Int32Ty, "end_int");
+
+        Builder.CreateBr(LoopBB);
+
+        // Loop body
+        Builder.SetInsertPoint(LoopBB);
+        PHINode* IndVar = Builder.CreatePHI(Int32Ty, 2, VarName);
+        IndVar->addIncoming(Start, PreheaderBB);
+
+        // Store old binding and create new one
+        Value* OldVal = NamedValues[VarName];
+        Value* LoopVar = Builder.CreateSIToFP(IndVar, FloatTy, VarName + "_f");
+        NamedValues[VarName] = LoopVar;
+
+        // Parse loop body
+        Value* BodyV = parseExpr(Tok);
+        if (!BodyV) return nullptr;
+
+        if (Tok.CurTok != TokRBrace) { std::cerr << "expected '}' after loop body\n"; return nullptr; }
+        Tok.getNextToken();
+
+        // Increment and check
+        Value* StepVal = ConstantInt::get(Int32Ty, 1);
+        Value* NextVar = Builder.CreateAdd(IndVar, StepVal, "nextvar");
+        Value* EndCond = Builder.CreateICmpSLT(NextVar, End, "loopcond");
+
+        BasicBlock* LoopEndBB = Builder.GetInsertBlock();
+        Builder.CreateCondBr(EndCond, LoopBB, AfterBB);
+
+        // For loops return 0.0
+        Builder.SetInsertPoint(AfterBB);
+
+        IndVar->addIncoming(NextVar, LoopEndBB);
+
+        // Restore old binding
+        if (OldVal) NamedValues[VarName] = OldVal;
+        else NamedValues.erase(VarName);
+
+        return ConstantFP::get(FloatTy, 0.0);
+    }
+
     Value* parsePrimary(Tokenizer& Tok) {
+        if (Tok.CurTok == TokIf) {
+            return parseIfExpr(Tok);
+        }
+
+        if (Tok.CurTok == TokFor) {
+            return parseForLoop(Tok);
+        }
+
         if (Tok.CurTok == TokFloat) {
             Value* V = ConstantFP::get(FloatTy, Tok.FloatVal);
             Tok.getNextToken();
@@ -147,13 +322,11 @@ public:
 
         if (Tok.CurTok == TokIdent) {
             std::string Name = Tok.IdentStr;
-            // consume identifier
             Tok.getNextToken();
 
-            // Function call: name ( arg, arg )
+            // Function call
             if (Tok.CurTok == TokLParen) {
-                // parse call args
-                Tok.getNextToken(); // consume '('
+                Tok.getNextToken();
                 std::vector<Value*> ArgsVals;
                 if (Tok.CurTok != TokRParen) {
                     while (true) {
@@ -165,12 +338,12 @@ public:
                     }
                 }
                 if (Tok.CurTok != TokRParen) { std::cerr << "expected ) in call\n"; return nullptr; }
-                Tok.getNextToken(); // consume ')'
+                Tok.getNextToken();
 
-                // find function in module
                 Function* F = Mod->getFunction(Name);
                 if (!F) { std::cerr << "unknown function " << Name << "\n"; return nullptr; }
                 
+                // Optimized dot product using vector_reduce_fadd intrinsic
                 if (Name == "dot" && ArgsVals.size() == 2) {
                     Type* t0 = ArgsVals[0]->getType();
                     Type* t1 = ArgsVals[1]->getType();
@@ -178,54 +351,16 @@ public:
                         t0->getScalarType()->isFloatTy() && t1->getScalarType()->isFloatTy() &&
                         cast<VectorType>(t0)->getElementCount().getKnownMinValue() ==
                         cast<VectorType>(t1)->getElementCount().getKnownMinValue()) {
-
-                        auto *vecTy = cast<FixedVectorType>(t0);
-                        unsigned N = vecTy->getNumElements(); 
-
-                        // vector multiply: v = a * b  (vector FMul)
-                        Value* v = Builder.CreateFMul(ArgsVals[0], ArgsVals[1], "vecmul");
-
-                        // horizontal reduction using shuffles + vector adds
-                        // For N a power of two (4, 8) this does pairwise summation:
-                        // for step = N/2, N/4, ..., 1:
-                        //   shuffled = shufflevector(v, v, mask_for_step)
-                        //   v = v + shuffled
-                        LLVMContext &Ctx = Context; // use your member Context
-                        Type* i32Ty = Type::getInt32Ty(Ctx);
-
-                        while (N > 1) {
-                            unsigned step = N / 2;
-                            SmallVector<Constant*, 16> maskConsts;
-                            maskConsts.reserve(cast<FixedVectorType>(vecTy)->getNumElements());
-
-                            unsigned totalLanes = cast<FixedVectorType>(vecTy)->getNumElements();
-                            for (unsigned i = 0; i < totalLanes; ++i) {
-                                unsigned idx;
-                                if (i < step) idx = i + step;
-                                else idx = i - step;
-                                maskConsts.push_back(ConstantInt::get(i32Ty, idx));
-                            }
-
-                            // Create a constant vector mask for shufflevector
-                            Constant* mask = ConstantVector::get(maskConsts);
-                            v = Builder.CreateFAdd(v, Builder.CreateShuffleVector(v, v, mask), "vreduce");
-                            // halve the effective vector width for next iteration
-                            // (we use the same vector type but the mask pairs lanes progressively)
-                            N = step;
-                        }
-
-                        // After reduction the full vector has the total in each lane (0..),
-                        // extract element 0 to get scalar result
-                        Value* scalar = Builder.CreateExtractElement(v, Builder.getInt32(0), "dot_result");
-                        return scalar;
+                        
+                        Value* mul = Builder.CreateFMul(ArgsVals[0], ArgsVals[1], "vecmul");
+                        return reduceVector(mul);
                     }
                 }
 
-                // fallback to normal call if not the dot-vector pattern
                 return Builder.CreateCall(F, ArgsVals, "calltmp");
             }
 
-            // Otherwise treat as variable (possibly followed by field access)
+            // Variable
             auto it = NamedValues.find(Name);
             if (it == NamedValues.end()) {
                 std::cerr << "unknown var " << Name << "\n";
@@ -233,21 +368,37 @@ public:
             }
             Value* V = it->second;
 
-            // Field access: v.x, v.y, etc.
+            // Swizzling and field access: v.x, v.yx, v.xyz, v.zwxy, etc.
             while (Tok.CurTok == TokDot) {
                 Tok.getNextToken();
-                if (Tok.CurTok != TokIdent) { std::cerr << "expected field\n"; return nullptr; }
-                std::string Field = Tok.IdentStr;
+                if (Tok.CurTok != TokIdent) { std::cerr << "expected field or swizzle\n"; return nullptr; }
+                std::string Swizzle = Tok.IdentStr;
                 Tok.getNextToken();
 
-                unsigned Idx = 0;
-                if (Field == "x") Idx = 0;
-                else if (Field == "y") Idx = 1;
-                else if (Field == "z") Idx = 2;
-                else if (Field == "w") Idx = 3;
-                else { std::cerr << "bad field\n"; return nullptr; }
+                if (!V->getType()->isVectorTy()) {
+                    std::cerr << "cannot swizzle non-vector type\n";
+                    return nullptr;
+                }
 
-                V = Builder.CreateExtractElement(V, Builder.getInt32(Idx), "extract");
+                // Parse swizzle string
+                SmallVector<Constant*, 8> Mask;
+                for (char c : Swizzle) {
+                    int idx = -1;
+                    if (c == 'x') idx = 0;
+                    else if (c == 'y') idx = 1;
+                    else if (c == 'z') idx = 2;
+                    else if (c == 'w') idx = 3;
+                    else { std::cerr << "invalid swizzle component: " << c << "\n"; return nullptr; }
+                    Mask.push_back(Builder.getInt32(idx));
+                }
+
+                if (Mask.size() == 1) {
+                    // Single element extract
+                    V = Builder.CreateExtractElement(V, Mask[0], "extract");
+                } else {
+                    // Multi-element swizzle
+                    V = Builder.CreateShuffleVector(V, V, ConstantVector::get(Mask), "swizzle");
+                }
             }
             return V;
         }
@@ -281,13 +432,8 @@ public:
     }
 
     void compile(const std::string& Source) {
-        // create a new module for each compile
         Mod = std::make_unique<Module>("blaze_vec", Context);
         Tokenizer Tok(Source);
-
-        // Two-pass small improvement: declare function prototypes first
-        // We'll parse top-level to collect function names/signatures before bodies.
-        // For simplicity here we do a single-pass but create Function before parsing body (already done below).
 
         while (Tok.CurTok != TokEof) {
             if (Tok.CurTok == TokFn) {
@@ -299,7 +445,6 @@ public:
                 if (Tok.CurTok != TokLParen) { std::cerr << "expected (\n"; return; }
                 Tok.getNextToken();
 
-                // Collect arg names & types (we need types to construct function type)
                 std::vector<std::pair<std::string, Type*>> Args;
                 while (Tok.CurTok == TokIdent) {
                     std::string Name = Tok.IdentStr;
@@ -315,41 +460,34 @@ public:
                 if (Tok.CurTok != TokRParen) { std::cerr << "expected )\n"; return; }
                 Tok.getNextToken();
 
-                // Return type (optional)
                 Type* RetTy = Type::getFloatTy(Context);
                 if (Tok.CurTok == TokArrow) {
                     Tok.getNextToken();
                     Type* parsed = parseType(Tok);
                     if (parsed) RetTy = parsed;
-                    else { std::cerr << "bad return type; defaulting to f32\n"; }
                 }
 
-                // Expect function body
                 if (Tok.CurTok != TokLBrace) { std::cerr << "expected {\n"; return; }
 
-                // Build function in module so other functions can call it
                 std::vector<Type*> ArgTypes;
                 for (auto &p : Args) ArgTypes.push_back(p.second);
                 Function* F = Function::Create(FunctionType::get(RetTy, ArgTypes, false),
                                                Function::ExternalLinkage, FnName, Mod.get());
 
-                // Create entry block and set up builder
                 BasicBlock* BB = BasicBlock::Create(Context, "entry", F);
                 Builder.SetInsertPoint(BB);
 
-                // Prepare NamedValues for this function
                 NamedValues.clear();
+                NamedAllocas.clear();
                 unsigned i = 0;
                 for (auto &A : F->args()) {
                     A.setName(Args[i].first);
-                    // For simplicity, bind the Function argument value directly (no alloca)
                     NamedValues[Args[i++].first] = &A;
                 }
 
-                // consume '{'
-                Tok.getNextToken();
+                Tok.getNextToken(); // consume '{'
 
-                // Parse statements inside function
+                // Parse variable declarations (pure SSA - no allocas unless needed)
                 while (Tok.CurTok == TokVar) {
                     Tok.getNextToken();
                     if (Tok.CurTok != TokIdent) { std::cerr << "expected var name\n"; return; }
@@ -359,15 +497,25 @@ public:
                     Tok.getNextToken();
                     Type* VarTy = parseType(Tok);
                     if (!VarTy) { std::cerr << "bad var type\n"; return; }
+                    
                     Value* Init = nullptr;
                     if (Tok.CurTok == TokLBrace) {
-                        // parse vector literal
                         Init = parseVectorLiteral(Tok, cast<FixedVectorType>(VarTy));
+                        if (!Init) return;
+                    } else if (Tok.CurTok == TokAssign) {
+                        Tok.getNextToken();
+                        Init = parseExpr(Tok);
+                        if (!Init) return;
                     }
-                    // create alloca and store initialiser
-                    Value* Alloca = Builder.CreateAlloca(VarTy, nullptr, VarName);
-                    if (Init) Builder.CreateStore(Init, Alloca);
-                    NamedValues[VarName] = Builder.CreateLoad(VarTy, Alloca, VarName);
+                    
+                    // Pure SSA: directly bind value, no alloca/store/load
+                    if (Init) {
+                        NamedValues[VarName] = Init;
+                    } else {
+                        // No initializer - create undef value
+                        NamedValues[VarName] = UndefValue::get(VarTy);
+                    }
+                    
                     if (Tok.CurTok == TokSemi) Tok.getNextToken();
                 }
 
@@ -381,48 +529,35 @@ public:
                 if (Tok.CurTok != TokRBrace) { std::cerr << "expected }\n"; return; }
                 Tok.getNextToken();
 
-                // verify the function (will print errors if invalid)
                 if (verifyFunction(*F, &errs())) {
                     std::cerr << "Function verification failed\n";
                     return;
                 }
             } else {
-                // ignore unexpected top-level tokens reliably
                 Tok.getNextToken();
             }
         }
 
-        // Print IR before moving module to JIT
         Mod->print(errs(), nullptr);
 
-        // Move module into JIT
         cantFail(JIT->addIRModule(ThreadSafeModule(std::move(Mod),
             ThreadSafeContext(std::make_unique<LLVMContext>()))));
 
-        // attempt to look up main
         auto MainSym = JIT->lookup("main");
         if (!MainSym) {
             std::cerr << "main() not found in JIT module\n";
             return;
         }
 
-        // cast and call
         float (*MainPtr)() = (float(*)())MainSym->getValue();
         float result = MainPtr();
         std::cout << "=> " << result << "\n";
-        if (std::fabs(result - 70.0f) < 0.001f) {
-            std::cout << "✓ Auto-vectorization worked! (1*5 + 2*6 + 3*7 + 4*8 = 70)\n";
-        }
     }
 };
 
-// ──────────────────────────────────────────────────────────────
-// REPL (use EOF sentinel to compile multi-line input)
-// ──────────────────────────────────────────────
 int main() {
     Compiler C;
-    std::cout << "Blaze REPL v2 — now with vec4 f32 + auto-vectorization!\n";
-    std::cout << "Enter program lines; type a line with only 'EOF' to compile/run.\n";
+    std::cout << "Blaze REPL v3 — vec4/vec8 + swizzling + if/else + for loops + pure SSA!\n";
 
     std::string Line, Source;
     while (std::cout << "> " && std::getline(std::cin, Line)) {
